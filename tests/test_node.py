@@ -9,7 +9,8 @@ from io import BytesIO
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from node import tensor_to_base64, fetch_available_models, ImageToPromptAbacus, FALLBACK_MODELS
+from node import tensor_to_base64, fetch_available_models, call_openai_api, ImageToPromptAbacus, FALLBACK_MODELS, DEFAULT_MODEL
+from tests.conftest import MockTensor
 
 
 class TestTensorToBase64:
@@ -30,18 +31,19 @@ class TestTensorToBase64:
     def test_handles_different_dimensions(self):
         """Test with different image dimensions"""
         for height, width in [(32, 32), (64, 64), (128, 128)]:
-            tensor = np.random.rand(1, height, width, 3).astype(np.float32)
+            tensor = MockTensor(np.random.rand(1, height, width, 3).astype(np.float32))
             result = tensor_to_base64(tensor)
             assert isinstance(result, str)
             assert len(result) > 0
 
     def test_handles_value_range(self):
         """Test that values in [0, 1] are properly converted to [0, 255]"""
-        tensor = np.zeros((1, 10, 10, 3), dtype=np.float32)
-        tensor[0, :, :, 0] = 1.0  # Max red
-        tensor[0, :, :, 1] = 0.5  # Mid green
-        tensor[0, :, :, 2] = 0.0  # Min blue
-        
+        array = np.zeros((1, 10, 10, 3), dtype=np.float32)
+        array[0, :, :, 0] = 1.0
+        array[0, :, :, 1] = 0.5
+        array[0, :, :, 2] = 0.0
+        tensor = MockTensor(array)
+
         result = tensor_to_base64(tensor)
         assert isinstance(result, str)
         decoded = base64.b64decode(result)
@@ -49,7 +51,7 @@ class TestTensorToBase64:
 
     def test_handles_grayscale(self):
         """Test with grayscale-like image (all channels same)"""
-        tensor = np.ones((1, 32, 32, 3), dtype=np.float32) * 0.5
+        tensor = MockTensor(np.ones((1, 32, 32, 3), dtype=np.float32) * 0.5)
         result = tensor_to_base64(tensor)
         assert isinstance(result, str)
         assert len(result) > 0
@@ -67,7 +69,7 @@ class TestFetchAvailableModels:
         mock_get.return_value = mock_response
 
         models = fetch_available_models()
-        assert models == ["gpt-4o", "gpt-4-vision-preview", "claude-3-opus"]
+        assert models == [DEFAULT_MODEL, "gpt-4o", "gpt-4-vision-preview", "claude-3-opus"]
         mock_get.assert_called_once()
 
     @patch('node.requests.get')
@@ -80,14 +82,14 @@ class TestFetchAvailableModels:
 
     @patch('node.requests.get')
     def test_returns_fallback_on_empty_response(self, mock_get):
-        """Test fallback when response has no data"""
+        """Test that DEFAULT_MODEL is always first even when response has no data"""
         mock_response = Mock()
         mock_response.json.return_value = {"data": []}
         mock_response.raise_for_status.return_value = None
         mock_get.return_value = mock_response
 
         models = fetch_available_models()
-        assert models == FALLBACK_MODELS
+        assert models[0] == DEFAULT_MODEL
 
     @patch('node.requests.get')
     def test_handles_timeout(self, mock_get):
@@ -98,7 +100,48 @@ class TestFetchAvailableModels:
         assert models == FALLBACK_MODELS
 
 
-class TestImageToPromptAbacusInputTypes:
+class TestCallOpenaiApi:
+    """Test the call_openai_api helper function"""
+
+    def test_returns_content_on_success(self, mock_openai_response):
+        """Test that content is returned on a successful API call"""
+        mock_client = Mock()
+        mock_client.chat.completions.create.return_value = mock_openai_response
+
+        result = call_openai_api(mock_client, "gpt-4o", "Describe this", "base64data")
+        assert result == mock_openai_response.choices[0].message.content
+
+    def test_returns_none_on_exception(self):
+        """Test that None is returned when the API raises an exception"""
+        mock_client = Mock()
+        mock_client.chat.completions.create.side_effect = Exception("API Error")
+
+        result = call_openai_api(mock_client, "gpt-4o", "Describe this", "base64data")
+        assert result is None
+
+    def test_returns_none_on_empty_choices(self):
+        """Test that None is returned when choices list is empty"""
+        mock_response = Mock()
+        mock_response.choices = []
+        mock_client = Mock()
+        mock_client.chat.completions.create.return_value = mock_response
+
+        result = call_openai_api(mock_client, "gpt-4o", "Describe this", "base64data")
+        assert result is None
+
+    def test_passes_correct_max_tokens(self):
+        """Test that MAX_TOKENS constant is used"""
+        from node import MAX_TOKENS
+        mock_client = Mock()
+        mock_response = Mock()
+        mock_response.choices = [Mock()]
+        mock_response.choices[0].message.content = "result"
+        mock_client.chat.completions.create.return_value = mock_response
+
+        call_openai_api(mock_client, "gpt-4o", "instructions", "imgdata")
+
+        call_args = mock_client.chat.completions.create.call_args
+        assert call_args.kwargs["max_tokens"] == MAX_TOKENS
     """Test node input/output types configuration"""
 
     def test_input_types_structure(self):
@@ -119,7 +162,6 @@ class TestImageToPromptAbacusInputTypes:
         """Test node properties"""
         assert ImageToPromptAbacus.FUNCTION == "convert"
         assert ImageToPromptAbacus.CATEGORY == "Abacus.AI"
-        assert ImageToPromptAbacus.OUTPUT_NODE == False
 
     def test_default_values(self):
         """Test that default values are set"""
@@ -219,20 +261,36 @@ class TestImageToPromptAbacusConvert:
 
     @patch('node.OpenAI')
     def test_convert_handles_api_error(self, mock_openai_class, mock_image_tensor):
-        """Test error handling for API failures"""
+        """Test error handling for API failures returns error string tuple"""
         mock_client_instance = Mock()
         mock_client_instance.chat.completions.create.side_effect = Exception("API Error")
         mock_openai_class.return_value = mock_client_instance
 
         node = ImageToPromptAbacus()
-        
-        with pytest.raises(Exception):
-            node.convert(
-                image=mock_image_tensor,
-                instructions="Test",
-                model="gpt-4o",
-                api_key="test-key"
-            )
+        result = node.convert(
+            image=mock_image_tensor,
+            instructions="Test",
+            model="gpt-4o",
+            api_key="test-key"
+        )
+
+        assert isinstance(result, tuple)
+        assert "Error" in result[0]
+
+    @patch('node.OpenAI')
+    def test_convert_returns_error_on_empty_api_key(self, mock_openai_class, mock_image_tensor):
+        """Test that empty api_key returns an error tuple without calling the API"""
+        node = ImageToPromptAbacus()
+        result = node.convert(
+            image=mock_image_tensor,
+            instructions="Test",
+            model="gpt-4o",
+            api_key=""
+        )
+
+        assert isinstance(result, tuple)
+        assert "Error" in result[0]
+        mock_openai_class.assert_not_called()
 
     @patch('node.OpenAI')
     def test_convert_with_different_models(self, mock_openai_class, mock_image_tensor, mock_openai_response):

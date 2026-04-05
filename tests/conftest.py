@@ -8,22 +8,37 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 
+class MockTensor:
+    """Wraps a numpy array to mimic a PyTorch tensor with .cpu().numpy() support."""
+
+    def __init__(self, array: np.ndarray):
+        self._array = array
+
+    def __getitem__(self, idx):
+        return MockTensor(self._array[idx])
+
+    def cpu(self):
+        return self
+
+    def numpy(self):
+        return self._array
+
+
 @pytest.fixture
 def mock_image_tensor():
     """Create a mock image tensor in ComfyUI format: [B, H, W, C] float32 [0, 1]"""
-    # Simple red square: single batch, 64x64, 3 channels
-    tensor = np.ones((1, 64, 64, 3), dtype=np.float32)
-    tensor[0, :, :, 0] = 1.0  # Red channel
-    tensor[0, :, :, 1] = 0.0  # Green channel
-    tensor[0, :, :, 2] = 0.0  # Blue channel
-    return tensor
+    array = np.ones((1, 64, 64, 3), dtype=np.float32)
+    array[0, :, :, 0] = 1.0
+    array[0, :, :, 1] = 0.0
+    array[0, :, :, 2] = 0.0
+    return MockTensor(array)
 
 
 @pytest.fixture
 def mock_small_image_tensor():
     """Create a small test image tensor for quick tests"""
-    tensor = np.random.rand(1, 32, 32, 3).astype(np.float32)
-    return tensor
+    array = np.random.rand(1, 32, 32, 3).astype(np.float32)
+    return MockTensor(array)
 
 
 @pytest.fixture
